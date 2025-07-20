@@ -7,6 +7,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 from cv_bridge import CvBridge
+from api.command_publisher import CommandPublisher
 import cv2
 import base64
 import threading
@@ -44,32 +45,31 @@ def login_check():
         return user_id
     else:
         return "fail"
+
 @app.route('/submit_order', methods=['POST'])
 def submit_order():
-    import json
+    global command_node
     name = request.form.get('name')
     phone = request.form.get('phone')
     address = request.form.get('address')
-    cart_items_json = request.form.get('cart_items')
-    if not all([name, phone, address, cart_items_json]):
+    product_name = request.form.get('product_name')
+    product_ea = request.form.get('product_ea')
+
+    if not all([name, phone, address, product_name, product_ea]):
         return "missing data", 400
-    try:
-        cart_items = json.loads(cart_items_json)
-    except Exception as e:
-        print(":x: JSON 파싱 오류:", e)
-        return "invalid cart_items", 400
-    if not cart_items:
-        return "empty cart", 400
+    
+    if command_node:
+        command_node.publish_command([address, product_name])
+    else:
+        print("⚠️ command_node is not ready")
+
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        for item in cart_items:
-            product_name = item['product_name']
-            product_ea = item['quantity']
-            cursor.execute('''
-                INSERT INTO orders_history (name, phone, address, product_name, product_ea)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (name, phone, address, product_name, product_ea))
+        cursor.execute('''
+            INSERT INTO orders_history (name, phone, address, product_name, product_ea)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (name, phone, address, product_name, product_ea))
         conn.commit()
         return "success"
     except Exception as e:
@@ -80,6 +80,8 @@ def submit_order():
     finally:
         if 'conn' in locals():
             conn.close()
+  
+            
 @app.route('/add_to_cart', methods=['POST'])
 def add_to_cart():
     data = request.get_json()
@@ -137,6 +139,7 @@ DB_PATH = os.path.join(os.path.dirname(__file__), 'database', 'database.db')
 # --- ROS 2 데이터 저장을 위한 전역 변수 (Flask 앱이 접근) ---
 global_ros_image_data = None # Base64 인코딩된 이미지 데이터
 global_ros_result_text = "YOLO 결과를 기다리는 중..." # 결과 텍스트 (초기 메시지)
+command_node = None
 # --- ROS 2 구독 노드 클래스 (Flask 앱 내부에 통합) ---
 class RosWebBridgeNode(Node):
     def __init__(self):
@@ -176,9 +179,19 @@ class RosWebBridgeNode(Node):
         # self.get_logger().info(f'결과 수신: {global_ros_result_text[:50]}...')
 # --- ROS 2 노드를 별도 스레드에서 실행하는 함수 ---
 def run_ros_node_thread():
+    global command_node
     rclpy.init(args=None)
     node = RosWebBridgeNode()
-    rclpy.spin(node) # ROS 2 노드가 계속 실행되면서 토픽을 구독
+    command_node = CommandPublisher()
+    executor = rclpy.executors.MultiThreadedExecutor()
+    executor.add_node(node)
+    executor.add_node(command_node)
+
+    executor.spin()
+
+    node.destroy_node()
+    command_node.destroy_node()
+
     node.destroy_node()
     rclpy.shutdown()
 # --- ROS 2 데이터를 웹으로 제공하는 새로운 API 엔드포인트 ---
